@@ -178,12 +178,12 @@ void NotificationController::fetchFakeChannels()
                 std::unordered_set<QString> liveStreams;
                 for (const auto &stream : streams)
                 {
-                    liveStreams.insert(stream.userLogin);
+                    liveStreams.insert(stream.userName);
                 }
 
                 for (const auto &name : batch)
                 {
-                    auto it = liveStreams.find(name.toLower());
+                    auto it = liveStreams.find(name);
                     this->checkStream(it != liveStreams.end(), name);
                 }
             },

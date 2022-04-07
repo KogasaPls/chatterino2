@@ -86,10 +86,8 @@ struct HelixUsersFollowsResponse {
 struct HelixStream {
     QString id;  // stream id
     QString userId;
-    QString userLogin;
     QString userName;
     QString gameId;
-    QString gameName;
     QString type;
     QString title;
     int viewerCount;
@@ -100,10 +98,8 @@ struct HelixStream {
     HelixStream()
         : id("")
         , userId("")
-        , userLogin("")
         , userName("")
         , gameId("")
-        , gameName("")
         , type("")
         , title("")
         , viewerCount()
@@ -116,10 +112,8 @@ struct HelixStream {
     explicit HelixStream(QJsonObject jsonObject)
         : id(jsonObject.value("id").toString())
         , userId(jsonObject.value("user_id").toString())
-        , userLogin(jsonObject.value("user_login").toString())
         , userName(jsonObject.value("user_name").toString())
         , gameId(jsonObject.value("game_id").toString())
-        , gameName(jsonObject.value("game_name").toString())
         , type(jsonObject.value("type").toString())
         , title(jsonObject.value("title").toString())
         , viewerCount(jsonObject.value("viewer_count").toInt())
