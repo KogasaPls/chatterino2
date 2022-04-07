@@ -54,8 +54,6 @@ public:
     void growWidth(int width);
     int normalTabWidth();
 
-    bool getIsLive() const;
-
 protected:
     virtual void themeChangedEvent() override;
 
