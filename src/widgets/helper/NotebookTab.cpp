@@ -732,6 +732,18 @@ bool NotebookTab::isLive() const
     return this->isLive_;
 }
 
+bool NotebookTab::setConnected(bool isConnected)
+{
+    if (this->isConnected_ == isConnected)
+    {
+        return false;
+    }
+
+    this->isConnected_ = isConnected;
+    this->update();
+    return true;
+}
+
 HighlightState NotebookTab::highlightState() const
 {
     return this->highlightState_;
@@ -1003,6 +1015,24 @@ void NotebookTab::paintEvent(QPaintEvent *)
         translateRectForLocation(liveIndicatorRect, this->tabLocation_,
                                  this->selected_ ? 0 : -1);
         painter.drawEllipse(liveIndicatorRect);
+    }
+
+    // Draw a gray dot in the bottom-right when at least one channel in this
+    // tab is actively joined to Twitch chat.
+    if (this->isConnected_)
+    {
+        const QColor connectedIndicator(128, 128, 128);
+        painter.setPen(connectedIndicator);
+        painter.setBrush(connectedIndicator);
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        auto x = this->width() - (7 * scale);
+        auto y = this->height() - (8 * scale);
+        auto diameter = 4 * scale;
+        QRect connectedIndicatorRect(x, y, diameter, diameter);
+        translateRectForLocation(connectedIndicatorRect, this->tabLocation_,
+                                 this->selected_ ? 0 : -1);
+        painter.drawEllipse(connectedIndicatorRect);
     }
 
     // set the pen color

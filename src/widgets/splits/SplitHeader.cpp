@@ -565,6 +565,22 @@ std::unique_ptr<QMenu> SplitHeader::createMainMenu()
 
     if (twitchChannel)
     {
+        const auto channelName = this->split_->getChannel()->getName();
+        if (!channelName.isEmpty() && !channelName.startsWith("/"))
+        {
+            auto *stayConnectedAction =
+                menu->addAction("Stay connected to chat");
+            stayConnectedAction->setCheckable(true);
+            stayConnectedAction->setChecked(
+                getApp()->getTwitch()->isChannelPinned(channelName));
+
+            QObject::connect(stayConnectedAction, &QAction::toggled, this,
+                             [channelName](bool checked) {
+                                 getApp()->getTwitch()->setChannelPinned(
+                                     channelName, checked);
+                             });
+        }
+
         auto bothSeq = h->getDisplaySequence(
             HotkeyCategory::Split, "reloadEmotes", {std::vector<QString>()});
         auto channelSeq = h->getDisplaySequence(HotkeyCategory::Split,

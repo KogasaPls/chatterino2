@@ -261,6 +261,7 @@ private:
 
     void refreshTabTitle();
     void refreshTabLiveStatus();
+    void refreshTabConnectionStatus();
 
     std::vector<DropRect> dropRects_;
     DropOverlay overlay_;

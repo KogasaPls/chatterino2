@@ -9,6 +9,7 @@
 #include "common/QLogging.hpp"
 #include "common/WindowDescriptors.hpp"
 #include "debug/AssertInGuiThread.hpp"
+#include "providers/twitch/TwitchIrcServer.hpp"
 #include "singletons/Fonts.hpp"
 #include "singletons/Theme.hpp"
 #include "singletons/WindowManager.hpp"
@@ -99,6 +100,12 @@ void SplitContainer::setTab(NotebookTab *tab)
     this->tab_ = tab;
 
     this->tab_->page = this;
+
+    this->signalHolder_.managedConnect(
+        getApp()->getTwitch()->channelJoinedChanged,
+        [this](const QString &, bool) {
+            this->refreshTabConnectionStatus();
+        });
 
     this->refreshTab();
 }
@@ -220,6 +227,7 @@ void SplitContainer::addSplit(Split *split)
     this->splits_.push_back(split);
 
     this->refreshTab();
+    getApp()->getWindows()->visibleChannelsChanged.invoke();
 
     auto &&conns = this->connectionsPerSplit_[split];
 
@@ -236,6 +244,7 @@ void SplitContainer::addSplit(Split *split)
         if (this->tab_ != nullptr)
         {
             this->tab_->newHighlightSourceAdded(split->getChannelView());
+            this->refreshTabConnectionStatus();
         }
     });
 
@@ -355,6 +364,7 @@ SplitContainer::Position SplitContainer::releaseSplit(Split *split)
     }
 
     this->refreshTab();
+    getApp()->getWindows()->visibleChannelsChanged.invoke();
 
     this->connectionsPerSplit_.erase(this->connectionsPerSplit_.find(split));
 
@@ -787,6 +797,7 @@ void SplitContainer::refreshTab()
 {
     this->refreshTabTitle();
     this->refreshTabLiveStatus();
+    this->refreshTabConnectionStatus();
 }
 
 std::vector<Split *> SplitContainer::getSplits() const
@@ -1020,6 +1031,22 @@ void SplitContainer::refreshTabLiveStatus()
             notebook->refresh();
         }
     }
+}
+
+void SplitContainer::refreshTabConnectionStatus()
+{
+    if (this->tab_ == nullptr)
+    {
+        return;
+    }
+
+    const bool connected =
+        std::ranges::any_of(this->splits_, [](const auto *split) {
+            return getApp()->getTwitch()->isChannelJoined(
+                split->getChannel()->getName());
+        });
+
+    this->tab_->setConnected(connected);
 }
 
 //

@@ -68,6 +68,13 @@ public:
     bool setRerun(bool isRerun);
 
     /**
+     * @brief Sets whether any channel in this tab is currently joined
+     *
+     * Returns true if the status changed.
+     **/
+    bool setConnected(bool isConnected);
+
+    /**
      * @brief Returns true if any split in this tab is live
      **/
     bool isLive() const;
@@ -166,6 +173,7 @@ private:
 
     bool isLive_{};
     bool isRerun_{};
+    bool isConnected_{};
 
     int growWidth_ = 0;
     QSize computedMinimumSize;
