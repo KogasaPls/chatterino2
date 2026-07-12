@@ -38,6 +38,7 @@
 #include "providers/twitch/PubSubManager.hpp"
 #include "providers/twitch/TwitchAccount.hpp"
 #include "providers/twitch/TwitchIrcServer.hpp"
+#include "providers/twitch/TwitchRoomIdResolver.hpp"
 #include "providers/twitch/TwitchUsers.hpp"
 #include "singletons/Settings.hpp"
 #include "singletons/WindowManager.hpp"
@@ -57,6 +58,9 @@
 #include <QThread>
 #include <QTimer>
 #include <rapidjson/document.h>
+
+#include <algorithm>
+#include <optional>
 
 using namespace Qt::StringLiterals;
 
@@ -271,6 +275,16 @@ void TwitchChannel::initialize()
 {
     this->refreshChatters();
     this->refreshBadges();
+
+    if (getApp()->isTest())
+    {
+        return;
+    }
+
+    // IRC normally provides the room ID through ROOMSTATE after JOIN. Channels
+    // which start disconnected still need an ID so the Helix live-status
+    // controller can track them.
+    detail::resolveTwitchChannelRoomId(this->weakFromThis());
 }
 
 bool TwitchChannel::isEmpty() const
@@ -1021,18 +1035,58 @@ QString TwitchChannel::roomId() const
 
 void TwitchChannel::setRoomId(const QString &id)
 {
-    if (*this->roomID_.accessConst() != id)
+    bool changed = false;
+    QString previousId;
     {
-        *this->roomID_.access() = id;
-        // This is intended for tests and benchmarks. See comment in constructor.
-        if (!getApp()->isTest())
+        auto roomID = this->roomID_.access();
+        if (*roomID != id)
         {
-            this->roomIdChanged();
-            this->loadRecentMessages();
+            previousId = *roomID;
+            *roomID = id;
+            changed = true;
         }
-        this->disconnected_ = false;
-        this->lastConnectedAt_ = std::chrono::system_clock::now();
     }
+
+    if (changed)
+    {
+        if (!previousId.isEmpty())
+        {
+            getApp()->getTwitchLiveController()->remove(previousId, this);
+        }
+        this->roomIdInitialized_ = false;
+    }
+
+    // A Helix lookup may have populated roomID_ before the first IRC JOIN.
+    // Run the IRC-dependent initialization exactly once even when the ID did
+    // not change in this call.
+    if (!getApp()->isTest() && !this->roomIdInitialized_)
+    {
+        this->roomIdInitialized_ = true;
+        this->roomIdChanged();
+        this->loadRecentMessages();
+    }
+
+    this->disconnected_ = false;
+    this->lastConnectedAt_ = std::chrono::system_clock::now();
+}
+
+void TwitchChannel::setRoomIdFromHelix(const QString &id)
+{
+    if (id.isEmpty())
+    {
+        return;
+    }
+
+    {
+        auto roomID = this->roomID_.access();
+        if (!roomID->isEmpty())
+        {
+            return;
+        }
+        *roomID = id;
+    }
+
+    getApp()->getTwitchLiveController()->add(this->sharedFromThis());
 }
 
 SharedAccessGuard<const TwitchChannel::RoomModes>

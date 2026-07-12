@@ -413,6 +413,14 @@ Window &WindowManager::createWindow(WindowType type,
                                  this->closePopup(*popupID);
                              }
                          });
+
+        // Separate connection rather than a call inside the handler above, so
+        // upstream rewrites of that lambda don't conflict with this patch
+        // stack. Qt invokes slots in connection order, so this still runs
+        // after the window has been erased.
+        QObject::connect(window, &QWidget::destroyed, this, [this] {
+            this->visibleChannelsChanged.invoke();
+        });
     }
 
     return *window;

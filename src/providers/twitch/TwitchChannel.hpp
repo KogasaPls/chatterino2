@@ -219,6 +219,7 @@ public:
     bool isLive() const override;
     bool isRerun() const override;
     QString roomId() const;
+    void setRoomIdFromHelix(const QString &id);
     SharedAccessGuard<const RoomModes> accessRoomModes() const;
     SharedAccessGuard<const StreamStatus> accessStreamStatus() const;
 
@@ -553,6 +554,7 @@ private:
     UniqueAccess<StreamStatus> streamStatus_;
     UniqueAccess<RoomModes> roomModes;
     bool disconnected_{};
+    bool roomIdInitialized_{};
     std::optional<std::chrono::time_point<std::chrono::system_clock>>
         lastConnectedAt_{};
     std::atomic_flag loadingRecentMessages_ = ATOMIC_FLAG_INIT;

@@ -170,6 +170,7 @@ public:
 
     pajlada::Signals::Signal<Split *> selectSplit;
     pajlada::Signals::Signal<SplitContainer *> selectSplitContainer;
+    pajlada::Signals::NoArgSignal visibleChannelsChanged;
     pajlada::Signals::Signal<const MessagePtr &> scrollToMessageSignal;
 
     /// This is invoked when a context menu for a message is requested in any

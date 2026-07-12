@@ -8,11 +8,13 @@
 #include "common/Channel.hpp"
 #include "common/Common.hpp"
 #include "providers/irc/IrcConnection2.hpp"
+#include "providers/twitch/TwitchChatRetention.hpp"
 #include "util/RatelimitBucket.hpp"
 
 #include <IrcMessage>
 #include <pajlada/signals/signal.hpp>
 #include <pajlada/signals/signalholder.hpp>
+#include <QTimer>
 
 #include <chrono>
 #include <functional>
@@ -48,6 +50,12 @@ public:
 
     virtual ChannelPtr getOrAddChannel(const QString &dirtyChannelName) = 0;
     virtual ChannelPtr getChannelOrEmpty(const QString &dirtyChannelName) = 0;
+    virtual bool isChannelJoined(const QString &dirtyChannelName) const = 0;
+    virtual bool isChannelPinned(const QString &dirtyChannelName) const = 0;
+    virtual void setChannelPinned(const QString &dirtyChannelName,
+                                  bool pinned) = 0;
+
+    pajlada::Signals::Signal<const QString &, bool> channelJoinedChanged;
 
     virtual void addFakeMessage(const QString &data) = 0;
 
@@ -142,6 +150,10 @@ public:
     ChannelPtr getOrAddChannel(const QString &dirtyChannelName) override;
 
     ChannelPtr getChannelOrEmpty(const QString &dirtyChannelName) override;
+    bool isChannelJoined(const QString &dirtyChannelName) const override;
+    bool isChannelPinned(const QString &dirtyChannelName) const override;
+    void setChannelPinned(const QString &dirtyChannelName,
+                          bool pinned) override;
 
 private:
     Atomic<QString> lastUserThatWhisperedMe;
@@ -191,6 +203,20 @@ private:
 
     bool prepareToSend(const std::shared_ptr<TwitchChannel> &channel);
 
+    void loadChannelActivity();
+    void saveChannelActivity();
+    void loadPinnedChannels();
+    void savePinnedChannels();
+    void refreshChannelRetention(bool forceSave = false);
+    void scheduleChannelRetentionRefresh(qint64 delayMs = 0);
+    void joinChannel(const QString &channelName);
+    void leaveChannel(const QString &channelName);
+    bool confirmChannelJoined(const QString &channelName);
+    bool confirmChannelParted(const QString &channelName);
+    bool handleOwnJoinMessage(const QString &dirtyChannelName);
+    void resetChannelMembership();
+    void addChannelConnectedMessage(const ChannelPtr &channel);
+
     QMap<QString, std::weak_ptr<Channel>> channels;
     std::mutex channelMutex;
 
@@ -200,6 +226,10 @@ private:
     // Our rate limiting bucket for the Twitch join rate limits
     // https://dev.twitch.tv/docs/irc/guide#rate-limits
     QObjectPtr<RatelimitBucket> joinBucket_;
+
+    detail::TwitchChannelMembership membership_;
+    detail::TwitchChannelRetentionPolicy retentionPolicy_;
+    QTimer channelRetentionTimer_;
 
     std::mutex connectionMutex_;
 

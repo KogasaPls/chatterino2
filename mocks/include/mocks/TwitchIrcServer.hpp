@@ -61,6 +61,24 @@ public:
         return chan;
     }
 
+    bool isChannelJoined(const QString &dirtyChannelName) const override
+    {
+        (void)dirtyChannelName;
+        return false;
+    }
+
+    bool isChannelPinned(const QString &dirtyChannelName) const override
+    {
+        (void)dirtyChannelName;
+        return false;
+    }
+
+    void setChannelPinned(const QString &dirtyChannelName, bool pinned) override
+    {
+        (void)dirtyChannelName;
+        (void)pinned;
+    }
+
     void addFakeMessage(const QString &data) override
     {
     }

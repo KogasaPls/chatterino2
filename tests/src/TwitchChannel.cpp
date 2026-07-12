@@ -9,12 +9,15 @@
 #include "mocks/BaseApplication.hpp"
 #include "mocks/Logging.hpp"
 #include "mocks/TwitchIrcServer.hpp"
+#include "providers/twitch/TwitchRoomIdResolver.hpp"
 #include "Test.hpp"
 
 #include <QDateTime>
 #include <QString>
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace chatterino {
@@ -84,6 +87,8 @@ TEST(TwitchChannel, LiveUpdateGrouping)
 }  // namespace chatterino
 
 namespace chatterino::detail {
+
+using namespace std::chrono_literals;
 
 TEST(TwitchChannelDetail_isUnknownCommand, good)
 {
@@ -156,6 +161,55 @@ TEST(TwitchChannelDetail_isUnknownCommand, bad)
         ASSERT_TRUE(isUnknownCommand(input))
             << input << " should be considered an unknown command";
     }
+}
+
+TEST(TwitchChannelDetail_roomIdRetryDelay, retriesTransientFailuresWithBackoff)
+{
+    using enum RoomIdLookupFailure;
+
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(0, Transient), 5s);
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(1, Transient), 30s);
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(2, Transient), 2min);
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(3, Transient), 5min);
+}
+
+TEST(TwitchChannelDetail_roomIdRetryDelay, keepsRetryingWhileRequestsFail)
+{
+    using enum RoomIdLookupFailure;
+
+    // A Helix or network outage must not permanently cost a channel its live
+    // status, so transient failures never stop being retried.
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(5, Transient), 5min);
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(500, Transient), 5min);
+}
+
+TEST(TwitchChannelDetail_roomIdRetryDelay, givesUpOnChannelsTwitchDoesNotKnow)
+{
+    using enum RoomIdLookupFailure;
+
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(4, ChannelMissing), 5min);
+    EXPECT_EQ(twitchChannelRoomIdRetryDelay(5, ChannelMissing), std::nullopt);
+}
+
+TEST(TwitchChannelDetail_roomIdBatchSize, capsRequestsAtHelixLimit)
+{
+    EXPECT_EQ(twitchChannelRoomIdBatchSize(0), 0);
+    EXPECT_EQ(twitchChannelRoomIdBatchSize(1), 1);
+    EXPECT_EQ(twitchChannelRoomIdBatchSize(100), 100);
+    EXPECT_EQ(twitchChannelRoomIdBatchSize(101), 100);
+}
+
+TEST(TwitchChannelDetail_roomIdRequestTracker, ignoresLateRequestCompletion)
+{
+    TwitchRoomIdRequestTracker requests;
+    const auto timedOut = requests.begin();
+    EXPECT_TRUE(requests.finish(timedOut));
+
+    const auto current = requests.begin();
+    EXPECT_FALSE(requests.finish(timedOut));
+    EXPECT_TRUE(requests.isCurrent(current));
+    EXPECT_TRUE(requests.finish(current));
+    EXPECT_FALSE(requests.isResolving());
 }
 
 }  // namespace chatterino::detail

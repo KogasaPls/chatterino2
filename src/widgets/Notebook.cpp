@@ -380,6 +380,7 @@ void Notebook::select(QWidget *page, bool focusPage, bool recordInHistory)
 
     this->performLayout();
     this->updateTabVisibility();
+    getApp()->getWindows()->visibleChannelsChanged.invoke();
 }
 
 void Notebook::selectHistoryBack(bool focusPage)

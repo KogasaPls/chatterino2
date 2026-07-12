@@ -933,6 +933,16 @@ if (APPLE)
     list(APPEND SOURCE_FILES util/MacOsHelpers.mm)
 endif ()
 
+# Chat-retention fork sources. Kept in an append block rather than interleaved
+# into SOURCE_FILES above so upstream additions to that sorted list don't
+# conflict with this patch stack.
+list(APPEND SOURCE_FILES
+        providers/twitch/TwitchChatRetention.cpp
+        providers/twitch/TwitchChatRetention.hpp
+        providers/twitch/TwitchRoomIdResolver.cpp
+        providers/twitch/TwitchRoomIdResolver.hpp
+        )
+
 # Generate source groups for use in IDEs
 source_group(TREE ${CMAKE_SOURCE_DIR} FILES ${SOURCE_FILES})
 

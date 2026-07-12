@@ -833,6 +833,16 @@ private:
 
     FRIEND_TEST(HighlightControllerTest, BillTinHighlights);
 #endif
+
+    // Chat-retention fork settings. Declared here at the tail of the class,
+    // rather than beside the other /misc/twitch settings, so upstream changes
+    // to that block don't conflict with this patch stack. Settings are keyed
+    // by path string, so declaration order carries no meaning.
+public:
+    QStringSetting twitchChannelLastActive = {
+        "/misc/twitch/channelLastVisibleV2", "{}"};
+    QStringSetting twitchAlwaysConnectedChannels = {
+        "/misc/twitch/alwaysConnectedChannels", "[]"};
 };
 
 Settings *getSettings();

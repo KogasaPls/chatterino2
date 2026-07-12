@@ -80,6 +80,12 @@ set(test_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/lib/Snapshot.hpp
     )
 
+# Chat-retention fork tests, appended rather than interleaved above so upstream
+# additions to test_SOURCES don't conflict with this patch stack.
+list(APPEND test_SOURCES
+    ${CMAKE_CURRENT_LIST_DIR}/src/TwitchChatRetention.cpp
+    )
+
 add_executable(${PROJECT_NAME} ${test_SOURCES})
 
 if(CHATTERINO_SANITIZER_SUPPORT)

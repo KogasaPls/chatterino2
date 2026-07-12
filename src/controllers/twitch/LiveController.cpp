@@ -69,6 +69,28 @@ void TwitchLiveController::add(const std::shared_ptr<TwitchChannel> &newChannel)
     }
 }
 
+void TwitchLiveController::remove(const QString &channelID,
+                                  const TwitchChannel *expectedChannel)
+{
+    {
+        std::unique_lock lock(this->channelsMutex);
+        auto it = this->channels.find(channelID);
+        if (it == this->channels.end())
+        {
+            return;
+        }
+        auto channel = it->second.ptr.lock();
+        if (channel && channel.get() != expectedChannel)
+        {
+            return;
+        }
+        this->channels.erase(it);
+    }
+
+    std::unique_lock immediateRequestsLock(this->immediateRequestsMutex);
+    this->immediateRequests.erase(channelID);
+}
+
 void TwitchLiveController::request(std::optional<QStringList> optChannelIDs)
 {
     QStringList channelIDs;

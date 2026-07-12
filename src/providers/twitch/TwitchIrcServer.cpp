@@ -37,10 +37,18 @@
 #include <pajlada/signals/signal.hpp>
 #include <pajlada/signals/signalholder.hpp>
 #include <QCoreApplication>
+#include <QDateTime>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
 #include <QMetaEnum>
+#include <QStringList>
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
+#include <limits>
 #include <mutex>
 
 using namespace std::chrono_literals;
@@ -51,7 +59,17 @@ namespace {
 constexpr int JOIN_RATELIMIT_BUDGET = 18;
 constexpr int JOIN_RATELIMIT_COOLDOWN = 12500;
 
+constexpr qint64 CHANNEL_ACTIVITY_SAVE_INTERVAL_MS = 5LL * 60 * 1000;
+
 using namespace chatterino;
+
+bool isCurrentUser(const QString &nick)
+{
+    return QString::compare(
+               nick,
+               getApp()->getAccounts()->twitch.getCurrent()->getUserName(),
+               Qt::CaseInsensitive) == 0;
+}
 
 void sendHelixMessage(const std::shared_ptr<TwitchChannel> &channel,
                       const QString &message, const QString &replyParentId = {})
@@ -152,13 +170,25 @@ TwitchIrcServer::TwitchIrcServer()
     this->writeConnection_->moveToThread(
         QCoreApplication::instance()->thread());
 
-    // Apply a leaky bucket rate limiting to JOIN messages
+    // Apply a leaky bucket rate limiting to JOIN messages. Membership is not
+    // considered established until Twitch confirms the channel with USERSTATE
+    // or ROOMSTATE.
     auto actuallyJoin = [&](QString message) {
-        if (!this->channels.contains(message))
+        if (!this->channels.contains(message) || !this->readConnection_ ||
+            !this->readConnection_->isConnected())
+        {
+            this->membership_.cancelPendingJoin(message);
+            return;
+        }
+
+        if (!this->membership_.markJoinSent(
+                message, QDateTime::currentMSecsSinceEpoch()))
         {
             return;
         }
         this->readConnection_->sendRaw("JOIN #" + message);
+        this->scheduleChannelRetentionRefresh(
+            detail::TwitchChannelMembership::JOIN_ACK_TIMEOUT_MS);
     };
     this->joinBucket_.reset(new RatelimitBucket(
         JOIN_RATELIMIT_BUDGET, JOIN_RATELIMIT_COOLDOWN, actuallyJoin, this));
@@ -205,6 +235,15 @@ TwitchIrcServer::TwitchIrcServer()
     this->signalHolder.managedConnect(this->readConnection_->heartbeat, [this] {
         this->markChannelsConnected();
     });
+
+    this->loadChannelActivity();
+    this->loadPinnedChannels();
+
+    this->channelRetentionTimer_.setSingleShot(true);
+    QObject::connect(&this->channelRetentionTimer_, &QTimer::timeout, this,
+                     [this] {
+                         this->refreshChannelRetention();
+                     });
 }
 
 void TwitchIrcServer::initialize()
@@ -290,13 +329,359 @@ void TwitchIrcServer::initialize()
             this->reloadAllSevenTVChannelEmotes();
         },
         this->signalHolder, false);
+
+    this->signalHolder.managedConnect(
+        getApp()->getWindows()->visibleChannelsChanged, [this] {
+            this->scheduleChannelRetentionRefresh();
+        });
+
+    this->scheduleChannelRetentionRefresh();
 }
 
 void TwitchIrcServer::aboutToQuit()
 {
+    this->refreshChannelRetention(true);
+    this->channelRetentionTimer_.stop();
+
     this->signalHolder.clear();
 
     this->channels.clear();
+}
+
+void TwitchIrcServer::loadChannelActivity()
+{
+    this->retentionPolicy_.markSaved(QDateTime::currentMSecsSinceEpoch());
+
+    QJsonParseError error;
+    const auto document = QJsonDocument::fromJson(
+        getSettings()->twitchChannelLastActive.getValue().toUtf8(), &error);
+    if (error.error != QJsonParseError::NoError || !document.isObject())
+    {
+        return;
+    }
+
+    const auto object = document.object();
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it)
+    {
+        if (!it.value().isDouble())
+        {
+            continue;
+        }
+
+        const auto timestamp = static_cast<qint64>(it.value().toDouble());
+        if (timestamp <= 0)
+        {
+            continue;
+        }
+
+        this->retentionPolicy_.loadLastVisibleAt(cleanChannelName(it.key()),
+                                                 timestamp);
+    }
+}
+
+void TwitchIrcServer::saveChannelActivity()
+{
+    if (!this->retentionPolicy_.isDirty())
+    {
+        return;
+    }
+
+    QJsonObject object;
+    const auto &lastVisibleAt = this->retentionPolicy_.lastVisibleAt();
+    for (auto it = lastVisibleAt.constBegin(); it != lastVisibleAt.constEnd();
+         ++it)
+    {
+        object.insert(it.key(), static_cast<double>(it.value()));
+    }
+
+    getSettings()->twitchChannelLastActive.setValue(QString::fromUtf8(
+        QJsonDocument(object).toJson(QJsonDocument::Compact)));
+    getSettings()->requestSave();
+
+    this->retentionPolicy_.markSaved(QDateTime::currentMSecsSinceEpoch());
+}
+
+void TwitchIrcServer::loadPinnedChannels()
+{
+    QJsonParseError error;
+    const auto document = QJsonDocument::fromJson(
+        getSettings()->twitchAlwaysConnectedChannels.getValue().toUtf8(),
+        &error);
+    if (error.error != QJsonParseError::NoError || !document.isArray())
+    {
+        return;
+    }
+
+    for (const auto &value : document.array())
+    {
+        if (!value.isString())
+        {
+            continue;
+        }
+
+        const auto channelName = cleanChannelName(value.toString());
+        if (!channelName.isEmpty() && !channelName.startsWith("/"))
+        {
+            this->retentionPolicy_.loadAlwaysJoined(channelName);
+        }
+    }
+}
+
+void TwitchIrcServer::savePinnedChannels()
+{
+    QStringList channelNames;
+    const auto &alwaysJoined = this->retentionPolicy_.alwaysJoinedChannels();
+    channelNames.reserve(alwaysJoined.size());
+    for (const auto &channelName : alwaysJoined)
+    {
+        channelNames.push_back(channelName);
+    }
+    channelNames.sort(Qt::CaseInsensitive);
+
+    getSettings()->twitchAlwaysConnectedChannels.setValue(QString::fromUtf8(
+        QJsonDocument(QJsonArray::fromStringList(channelNames))
+            .toJson(QJsonDocument::Compact)));
+    getSettings()->requestSave();
+}
+
+void TwitchIrcServer::joinChannel(const QString &channelName)
+{
+    if (channelName.startsWith("/"))
+    {
+        return;
+    }
+
+    const bool connected =
+        this->readConnection_ && this->readConnection_->isConnected();
+    switch (this->membership_.requestJoin(channelName, connected,
+                                          QDateTime::currentMSecsSinceEpoch()))
+    {
+        case detail::MembershipAction::QueueJoin:
+            this->joinBucket_->send(channelName);
+            break;
+        case detail::MembershipAction::ScheduleRefresh:
+            this->scheduleChannelRetentionRefresh(
+                detail::TwitchChannelMembership::JOIN_RETRY_DELAY_MS);
+            break;
+        default:
+            break;
+    }
+}
+
+void TwitchIrcServer::leaveChannel(const QString &channelName)
+{
+    const auto result = this->membership_.leave(channelName);
+    if (result.joinedChanged)
+    {
+        this->channelJoinedChanged.invoke(channelName, false);
+
+        auto channel = this->getChannelOrEmpty(channelName);
+        if (auto *twitchChannel = dynamic_cast<TwitchChannel *>(channel.get()))
+        {
+            twitchChannel->markDisconnected();
+        }
+    }
+
+    if (result.sendPart && this->readConnection_ &&
+        this->readConnection_->isConnected())
+    {
+        this->readConnection_->sendRaw("PART #" + channelName);
+    }
+}
+
+bool TwitchIrcServer::confirmChannelJoined(const QString &dirtyChannelName)
+{
+    const auto channelName = cleanChannelName(dirtyChannelName);
+    const auto result = this->membership_.confirmJoined(channelName);
+    if (result.action == detail::MembershipAction::RejectJoin)
+    {
+        // A queued JOIN can race with the channel becoming inactive. Do not
+        // expose a transient connected state; immediately undo the late JOIN.
+        if (this->readConnection_ && this->readConnection_->isConnected())
+        {
+            this->readConnection_->sendRaw("PART #" + channelName);
+        }
+        return false;
+    }
+
+    if (result.joinedChanged)
+    {
+        this->channelJoinedChanged.invoke(channelName, true);
+        this->addChannelConnectedMessage(this->getChannelOrEmpty(channelName));
+    }
+    return true;
+}
+
+bool TwitchIrcServer::confirmChannelParted(const QString &dirtyChannelName)
+{
+    const auto channelName = cleanChannelName(dirtyChannelName);
+    const auto result = this->membership_.confirmParted(
+        channelName, QDateTime::currentMSecsSinceEpoch());
+    if (result.joinedChanged)
+    {
+        this->channelJoinedChanged.invoke(channelName, false);
+    }
+
+    if (result.action == detail::MembershipAction::ScheduleRefresh)
+    {
+        this->scheduleChannelRetentionRefresh(
+            detail::TwitchChannelMembership::JOIN_RETRY_DELAY_MS);
+    }
+
+    auto channel = this->getChannelOrEmpty(channelName);
+    if (auto *twitchChannel = dynamic_cast<TwitchChannel *>(channel.get()))
+    {
+        twitchChannel->markDisconnected();
+    }
+
+    return !this->membership_.wantsJoin(channelName);
+}
+
+bool TwitchIrcServer::handleOwnJoinMessage(const QString &dirtyChannelName)
+{
+    auto channel = this->getChannelOrEmpty(dirtyChannelName);
+    auto *twitchChannel = dynamic_cast<TwitchChannel *>(channel.get());
+    if (!twitchChannel)
+    {
+        return false;
+    }
+
+    // Retention joins and parts channels as they come in and out of view, so
+    // upstream's per-join system message would repeat alongside the
+    // connected/reconnected message that confirmChannelJoined already adds.
+    twitchChannel->joined.invoke();
+    return true;
+}
+
+void TwitchIrcServer::resetChannelMembership()
+{
+    for (const auto &channelName : this->membership_.reset())
+    {
+        this->channelJoinedChanged.invoke(channelName, false);
+    }
+}
+
+void TwitchIrcServer::addChannelConnectedMessage(const ChannelPtr &channel)
+{
+    if (!channel || channel->isEmpty())
+    {
+        return;
+    }
+
+    auto connectedMsg = makeSystemMessage("connected");
+    connectedMsg->flags.set(MessageFlag::ConnectedMessage);
+    auto reconnected = makeSystemMessage("reconnected");
+    reconnected->flags.set(MessageFlag::ConnectedMessage);
+
+    MessagePtr last = channel->getLastMessage();
+    const bool replaceMessage =
+        last && last->flags.has(MessageFlag::DisconnectedMessage);
+
+    if (replaceMessage)
+    {
+        channel->replaceMessage(last, reconnected);
+    }
+    else
+    {
+        channel->addMessage(connectedMsg, MessageContext::Original);
+    }
+}
+
+void TwitchIrcServer::scheduleChannelRetentionRefresh(qint64 delayMs)
+{
+    const auto boundedDelay = static_cast<int>(
+        std::clamp<qint64>(delayMs, 0, std::numeric_limits<int>::max()));
+
+    if (!this->channelRetentionTimer_.isActive() ||
+        this->channelRetentionTimer_.remainingTime() < 0 ||
+        boundedDelay < this->channelRetentionTimer_.remainingTime())
+    {
+        this->channelRetentionTimer_.start(boundedDelay);
+    }
+}
+
+void TwitchIrcServer::refreshChannelRetention(bool forceSave)
+{
+    assertInGuiThread();
+
+    const auto now = QDateTime::currentMSecsSinceEpoch();
+    const auto visibleNames = getApp()->getWindows()->getVisibleChannelNames();
+    QSet<QString> visible;
+    for (const auto &channelName : visibleNames)
+    {
+        if (!channelName.startsWith("/"))
+        {
+            visible.insert(channelName);
+        }
+    }
+
+    this->retentionPolicy_.updateVisible(visible, now);
+    this->retentionPolicy_.prune(now);
+
+    std::vector<ChannelPtr> activeChannels;
+    {
+        std::lock_guard lock(this->channelMutex);
+
+        activeChannels.reserve(this->channels.size());
+        for (const auto &weak : this->channels)
+        {
+            if (auto channel = weak.lock())
+            {
+                activeChannels.push_back(channel);
+            }
+        }
+    }
+
+    std::ranges::stable_partition(activeChannels, [&](const auto &channel) {
+        return visible.contains(channel->getName());
+    });
+
+    qint64 nextWakeAt = std::numeric_limits<qint64>::max();
+    for (const auto &channel : activeChannels)
+    {
+        const auto &channelName = channel->getName();
+        if (channelName.startsWith("/"))
+        {
+            continue;
+        }
+
+        if (this->retentionPolicy_.shouldKeepJoined(channelName, now))
+        {
+            this->joinChannel(channelName);
+            if (const auto expiry =
+                    this->retentionPolicy_.nextExpiry(channelName))
+            {
+                nextWakeAt = std::min(nextWakeAt, *expiry);
+            }
+        }
+        else
+        {
+            this->leaveChannel(channelName);
+        }
+    }
+
+    if (const auto membershipWakeAt = this->membership_.nextWakeAt())
+    {
+        nextWakeAt = std::min(nextWakeAt, *membershipWakeAt);
+    }
+
+    if (forceSave || now - this->retentionPolicy_.lastSavedAt() >=
+                         CHANNEL_ACTIVITY_SAVE_INTERVAL_MS)
+    {
+        this->saveChannelActivity();
+    }
+    else if (this->retentionPolicy_.isDirty())
+    {
+        nextWakeAt =
+            std::min(nextWakeAt, this->retentionPolicy_.lastSavedAt() +
+                                     CHANNEL_ACTIVITY_SAVE_INTERVAL_MS);
+    }
+
+    if (nextWakeAt != std::numeric_limits<qint64>::max())
+    {
+        this->scheduleChannelRetentionRefresh(
+            std::max<qint64>(0, nextWakeAt - now));
+    }
 }
 
 void TwitchIrcServer::initializeConnection(IrcConnection *connection,
@@ -399,13 +784,31 @@ void TwitchIrcServer::readConnectionMessageReceived(
 
     auto &handler = IrcMessageHandler::instance();
 
-    // Below commands enabled through the twitch.tv/membership CAP REQ
+    if (detail::isTwitchJoinConfirmation(command))
+    {
+        this->confirmChannelJoined(message->parameter(0));
+    }
+
+    // Below commands are normally enabled through the twitch.tv/membership CAP
+    // REQ. We still handle them for fake/debug messages and compatibility.
     if (command == "JOIN")
     {
+        if (isCurrentUser(message->nick()) &&
+            this->handleOwnJoinMessage(message->parameter(0)))
+        {
+            return;
+        }
         handler.handleJoinMessage(message);
     }
     else if (command == "PART")
     {
+        if (isCurrentUser(message->nick()) &&
+            this->confirmChannelParted(message->parameter(0)))
+        {
+            // Retention-initiated PARTs are normal and must not be presented as
+            // a ban/removal event by IrcMessageHandler.
+            return;
+        }
         handler.handlePartMessage(message);
     }
     else if (command == "USERSTATE")
@@ -477,60 +880,8 @@ void TwitchIrcServer::writeConnectionMessageReceived(
 
 void TwitchIrcServer::onReadConnected()
 {
-    std::vector<ChannelPtr> activeChannels;
-    {
-        std::lock_guard lock(this->channelMutex);
-
-        activeChannels.reserve(this->channels.size());
-        for (const auto &weak : this->channels)
-        {
-            if (auto channel = weak.lock())
-            {
-                activeChannels.push_back(channel);
-            }
-        }
-    }
-
-    // put the visible channels first
-    auto visible = getApp()->getWindows()->getVisibleChannelNames();
-
-    std::ranges::stable_partition(activeChannels, [&](const auto &chan) {
-        return visible.contains(chan->getName());
-    });
-
-    // join channels
-    for (const auto &channel : activeChannels)
-    {
-        // HACK(mm2pl): This prevents custom invalid twitch channels used by plugins from being joined
-        if (channel->getName().startsWith("/"))
-        {
-            continue;
-        }
-        this->joinBucket_->send(channel->getName());
-    }
-
-    // connected/disconnected message
-    auto connectedMsg = makeSystemMessage("connected");
-    connectedMsg->flags.set(MessageFlag::ConnectedMessage);
-    auto reconnected = makeSystemMessage("reconnected");
-    reconnected->flags.set(MessageFlag::ConnectedMessage);
-
-    for (const auto &chan : activeChannels)
-    {
-        MessagePtr last = chan->getLastMessage();
-
-        bool replaceMessage =
-            last && last->flags.has(MessageFlag::DisconnectedMessage);
-
-        if (replaceMessage)
-        {
-            chan->replaceMessage(last, reconnected);
-        }
-        else
-        {
-            chan->addMessage(connectedMsg, MessageContext::Original);
-        }
-    }
+    this->resetChannelMembership();
+    this->refreshChannelRetention(true);
 }
 
 void TwitchIrcServer::onDisconnected()
@@ -549,6 +900,14 @@ void TwitchIrcServer::onDisconnected()
             continue;
         }
 
+        // Retention leaves most channels parted. Upstream uses an empty room
+        // ID as the "never joined" sentinel, which no longer holds here
+        // because room IDs are resolved over Helix before the first JOIN.
+        if (!this->membership_.isJoined(chan->getName()))
+        {
+            continue;
+        }
+
         chan->addMessage(disconnectedMsg, MessageContext::Original);
 
         if (auto *channel = dynamic_cast<TwitchChannel *>(chan.get()))
@@ -556,6 +915,8 @@ void TwitchIrcServer::onDisconnected()
             channel->markDisconnected();
         }
     }
+
+    this->resetChannelMembership();
 }
 
 std::shared_ptr<Channel> TwitchIrcServer::getCustomChannel(
@@ -1073,7 +1434,12 @@ void TwitchIrcServer::dropSeventvChannel(const QString &userID,
 
 void TwitchIrcServer::markChannelsConnected()
 {
-    this->forEachChannel([](const ChannelPtr &chan) {
+    this->forEachChannel([this](const ChannelPtr &chan) {
+        if (!this->membership_.isJoined(chan->getName()))
+        {
+            return;
+        }
+
         if (auto *channel = dynamic_cast<TwitchChannel *>(chan.get()))
         {
             channel->markConnected();
@@ -1191,38 +1557,40 @@ ChannelPtr TwitchIrcServer::getOrAddChannel(const QString &dirtyChannelName)
     }
 
     this->channels.insert(channelName, chan);
-    this->signalHolder.managedConnect(
-        twitchChannel->destroyed, [this, channelName] {
-            // fourtf: issues when the server itself is destroyed
+    this->signalHolder.managedConnect(twitchChannel->destroyed, [this,
+                                                                 channelName] {
+        // fourtf: issues when the server itself is destroyed
 
-            qCDebug(chatterinoIrc) << "[TwitchIrcServer::addChannel]"
-                                   << channelName << "was destroyed";
-            this->channels.remove(channelName);
+        qCDebug(chatterinoIrc) << "[TwitchIrcServer::addChannel]" << channelName
+                               << "was destroyed";
+        this->channels.remove(channelName);
+        this->scheduleChannelRetentionRefresh();
 
-            if (this->readConnection_)
-            {
-                // HACK(mm2pl): This prevents custom invalid twitch channels used by plugins from being joined
-                if (!channelName.startsWith("/"))
-                {
-                    this->readConnection_->sendRaw("PART #" + channelName);
-                }
-            }
-        });
+        const auto membership = this->membership_.removeChannel(channelName);
+        if (membership.joinedChanged)
+        {
+            this->channelJoinedChanged.invoke(channelName, false);
+        }
 
-    // join IRC channel
-    {
-        std::lock_guard<std::mutex> lock2(this->connectionMutex_);
-
-        if (this->readConnection_ && this->readConnection_->isConnected())
+        if (membership.sendPart && this->readConnection_ &&
+            this->readConnection_->isConnected())
         {
             // HACK(mm2pl): This prevents custom invalid twitch channels used by plugins from being joined
             if (!channelName.startsWith("/"))
             {
-                this->joinBucket_->send(channelName);
+                this->readConnection_->sendRaw("PART #" + channelName);
             }
         }
+    });
+
+    // Normal channels are joined only after becoming visible. A channel
+    // explicitly pinned by the user is an exception and joins immediately.
+    if (this->retentionPolicy_.isAlwaysJoined(channelName))
+    {
+        this->joinChannel(channelName);
     }
 
+    this->scheduleChannelRetentionRefresh();
     return chan;
 }
 
@@ -1252,6 +1620,46 @@ ChannelPtr TwitchIrcServer::getChannelOrEmpty(const QString &dirtyChannelName)
     }
 
     return Channel::getEmpty();
+}
+
+bool TwitchIrcServer::isChannelJoined(const QString &dirtyChannelName) const
+{
+    return this->membership_.isJoined(cleanChannelName(dirtyChannelName));
+}
+
+bool TwitchIrcServer::isChannelPinned(const QString &dirtyChannelName) const
+{
+    return this->retentionPolicy_.isAlwaysJoined(
+        cleanChannelName(dirtyChannelName));
+}
+
+void TwitchIrcServer::setChannelPinned(const QString &dirtyChannelName,
+                                       bool pinned)
+{
+    assertInGuiThread();
+
+    const auto channelName = cleanChannelName(dirtyChannelName);
+    if (channelName.isEmpty() || channelName.startsWith("/"))
+    {
+        return;
+    }
+
+    if (!this->retentionPolicy_.setAlwaysJoined(channelName, pinned))
+    {
+        return;
+    }
+
+    this->savePinnedChannels();
+
+    if (pinned)
+    {
+        this->joinChannel(channelName);
+    }
+    else
+    {
+        // Return to the normal visibility and idle-timeout policy.
+        this->refreshChannelRetention();
+    }
 }
 
 }  // namespace chatterino
